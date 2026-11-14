@@ -485,50 +485,13 @@ class Qwen2Model(nn.Module):
             (batch_size, 1, sequence_length, sequence_length),
         )
 
-        # If an additional attention mask is provided, add it.
+        # If a padding mask (batch, seq) of 1s and 0s is provided, also mask
+        # out the padded key positions.
         if attention_mask is not None:
-            causal_mask = causal_mask + attention_mask
-
-        return causal_mask
-
-    @nn.nowrap
-    def _compute_rope_embeddings(self, hidden_states, position_ids, inv_freq=None):
-        if inv_freq is None:
-            dim = self.config.hidden_size // self.config.num_attention_heads
-            inv_freq = 1.0 / (
-                self.config.rope_theta
-                ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim)
-            )
-
-        inv_freq = jnp.expand_dims(jnp.expand_dims(inv_freq, 0), 0)
-        position_ids = jnp.expand_dims(position_ids.astype(jnp.float32), -1)
-        freqs = jnp.matmul(position_ids, inv_freq)
-        emb = jnp.concatenate([freqs, freqs], axis=-1)
-        cos = jnp.cos(emb)
-        sin = jnp.sin(emb)
-
-        return cos, sin
-
-    @nn.nowrap
-    def _prepare_causal_attention_mask(
-        self,
-        attention_mask: Optional[jnp.ndarray],
-        sequence_length: int,
-        dtype: jnp.dtype,
-        batch_size: int,
-    ):
-        min_dtype = jnp.finfo(dtype).min
-        causal_mask = jnp.triu(
-            jnp.full((sequence_length, sequence_length), min_dtype, dtype=dtype),
-            k=1,
-        )
-        causal_mask = jnp.broadcast_to(
-            causal_mask[None, None, :, :],
-            (batch_size, 1, sequence_length, sequence_length),
-        )
-
-        if attention_mask is not None:
-            causal_mask = causal_mask + attention_mask
+            padding_mask = jnp.where(
+                attention_mask[:, None, None, :] > 0, 0, min_dtype
+            ).astype(dtype)
+            causal_mask = jnp.minimum(causal_mask, padding_mask)
 
         return causal_mask
 
