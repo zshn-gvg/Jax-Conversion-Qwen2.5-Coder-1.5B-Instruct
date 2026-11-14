@@ -549,6 +549,7 @@ class Qwen2ForCausalLM(nn.Module):
         do_sample: bool = False,
         top_k: Optional[int] = None,
         prng_key: Optional[jax.random.PRNGKey] = None,
+        eos_token_id: Optional[int | list[int]] = None,
     ) -> jnp.ndarray:
         """
         Optimized generation using fixed-size padding. Parameter shardings
@@ -608,6 +609,7 @@ class Qwen2ForCausalLM(nn.Module):
 
         # Autoregressive generation loop.
         current_input_length = input_ids.shape[1]
+        finished = jnp.zeros((batch_size,), dtype=bool)
 
         for i in tqdm(range(max_new_tokens)):
             # Compute next token logits using the sharded function.
@@ -630,6 +632,12 @@ class Qwen2ForCausalLM(nn.Module):
                 next_token[:, 0]
             )
             attention_mask = attention_mask.at[:, current_input_length - 1].set(1)
+
+            # Stop once every sequence has produced an end-of-sequence token.
+            if eos_token_id is not None:
+                finished |= jnp.isin(next_token[:, 0], jnp.array(eos_token_id))
+                if finished.all():
+                    break
 
         # Return the generated sequence without the padded region.
         return padded_input[:, :current_input_length]
