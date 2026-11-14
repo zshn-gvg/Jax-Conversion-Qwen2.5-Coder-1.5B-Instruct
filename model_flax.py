@@ -51,10 +51,10 @@ class Qwen2Config:
         num_hidden_layers=28,  # Number of transformer (decoder) layers.
         num_attention_heads=12,  # Total number of attention heads.
         num_key_value_heads=2,  # Fewer key/value heads used for Grouped Query Attention (GQA).
-        max_position_embeddings=131072,  # Maximum context length.
+        max_position_embeddings=32768,  # Maximum context length.
         initializer_range=0.02,
         rms_norm_eps=1e-6,  # Small epsilon for RMSNorm stability.
-        rope_theta=10000.0,  # Parameter for Rotary Positional Embeddings (RoPE).
+        rope_theta=1000000.0,  # Parameter for Rotary Positional Embeddings (RoPE).
         attention_dropout=0.0,
         **kwargs,
     ):
