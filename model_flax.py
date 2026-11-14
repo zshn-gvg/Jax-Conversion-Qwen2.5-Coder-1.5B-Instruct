@@ -4,13 +4,12 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 from jax.sharding import Mesh
 from jax.sharding import NamedSharding
-from jax.experimental.pjit import pjit
 
 import flax
 import flax.linen as nn
 
 from typing import Any, Optional, Tuple
-from functools import partial
+import re
 from rich import print
 from tqdm import tqdm
 import numpy as np
@@ -40,6 +39,27 @@ def get_partition_rules():
         # Default rule
         (".*", None),
     ]
+
+
+def shard_params(params, mesh: Optional[Mesh] = None):
+    """Places params on `mesh` (default: all devices on a 1D "mp" axis)
+    following `get_partition_rules()`. Dimensions that do not divide evenly
+    over the mesh are replicated."""
+    if mesh is None:
+        mesh = Mesh(np.array(jax.devices()), ("mp",))
+    rules = get_partition_rules()
+
+    def place(path, x):
+        name = "/".join(str(getattr(k, "key", k)) for k in path)
+        spec = next(spec for rule, spec in rules if re.search(rule, name))
+        if spec is None or any(
+            axis is not None and dim % mesh.shape[axis]
+            for dim, axis in zip(x.shape, spec)
+        ):
+            spec = P()
+        return jax.device_put(x, NamedSharding(mesh, spec))
+
+    return jax.tree_util.tree_map_with_path(place, params)
 
 
 class Qwen2Config:
@@ -568,11 +588,11 @@ class Qwen2ForCausalLM(nn.Module):
         prng_key: Optional[jax.random.PRNGKey] = None,
     ) -> jnp.ndarray:
         """
-        Optimized generation using fixed-size padding and sharding.
+        Optimized generation using fixed-size padding. Parameter shardings
+        (e.g. from `shard_params`) are respected.
         """
-        # Create a device mesh for model parallelism.
-        devices = jax.devices()
-        mesh = Mesh(devices, ("mp",))
+        # Move params to device once (no-op for arrays already on device).
+        params = jax.tree_util.tree_map(jnp.asarray, params)
 
         # Determine the padded sequence length (input length + new tokens).
         max_sequence_length = input_ids.shape[1] + max_new_tokens
@@ -591,23 +611,8 @@ class Qwen2ForCausalLM(nn.Module):
             constant_values=0,
         )
 
-        # Define sharding for the padded forward pass.
-        input_spec = NamedSharding(mesh, P(None, None))  # (batch, padded_seq_len)
-
-        # Create a parameter spec to match the structure of `params`.
-        def create_param_spec(p):
-            if isinstance(p, dict):
-                return {k: create_param_spec(v) for k, v in p.items()}
-            return NamedSharding(mesh, P())  # default spec
-
-        param_spec = create_param_spec(params)
-
-        # Create a JIT-compiled, sharded step function using pjit.
-        @partial(
-            pjit,
-            in_shardings=(param_spec, input_spec, input_spec),
-            out_shardings=NamedSharding(mesh, P(None, None)),
-        )
+        # JIT-compiled step function; shardings follow the inputs.
+        @jax.jit
         def sharded_step(sharded_params, padded_ids, attn_mask):
             # Run the forward pass (without extra parameter nesting).
             outputs = self.apply(
@@ -641,28 +646,27 @@ class Qwen2ForCausalLM(nn.Module):
         # Autoregressive generation loop.
         current_input_length = input_ids.shape[1]
 
-        with mesh:
-            for i in tqdm(range(max_new_tokens)):
-                # Compute next token logits using the sharded function.
-                next_token_logits = sharded_step(params, padded_input, attention_mask)
+        for i in tqdm(range(max_new_tokens)):
+            # Compute next token logits using the sharded function.
+            next_token_logits = sharded_step(params, padded_input, attention_mask)
 
-                # Sample (if do_sample=True) or take the argmax.
-                if do_sample and prng_key is not None:
-                    prng_key, subkey = jax.random.split(prng_key)
-                    next_token = jax.random.categorical(
-                        subkey, next_token_logits, axis=-1
-                    )
-                else:
-                    next_token = jnp.argmax(next_token_logits, axis=-1)
-
-                # Insert the predicted token into the padded input.
-                next_token = next_token[:, None]
-                current_input_length += 1
-
-                padded_input = padded_input.at[:, current_input_length - 1].set(
-                    next_token[:, 0]
+            # Sample (if do_sample=True) or take the argmax.
+            if do_sample and prng_key is not None:
+                prng_key, subkey = jax.random.split(prng_key)
+                next_token = jax.random.categorical(
+                    subkey, next_token_logits, axis=-1
                 )
-                attention_mask = attention_mask.at[:, current_input_length - 1].set(1)
+            else:
+                next_token = jnp.argmax(next_token_logits, axis=-1)
+
+            # Insert the predicted token into the padded input.
+            next_token = next_token[:, None]
+            current_input_length += 1
+
+            padded_input = padded_input.at[:, current_input_length - 1].set(
+                next_token[:, 0]
+            )
+            attention_mask = attention_mask.at[:, current_input_length - 1].set(1)
 
         # Return the generated sequence without the padded region.
         return padded_input[:, :current_input_length]
