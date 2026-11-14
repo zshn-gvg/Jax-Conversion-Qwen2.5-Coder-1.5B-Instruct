@@ -6,6 +6,8 @@ from model_flax import Qwen2ForCausalLM, Qwen2Config
 from transformers import AutoModelForCausalLM
 import flax.serialization
 
+MODEL_NAME = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
+
 
 def convert_pytorch_to_jax_cpu(pytorch_state_dict, flax_params):
     """
@@ -22,7 +24,7 @@ def convert_pytorch_to_jax_cpu(pytorch_state_dict, flax_params):
 
     # Helper function to convert torch tensor to numpy array
     def torch_to_numpy(tensor):
-        return tensor.cpu().numpy()
+        return tensor.detach().float().cpu().numpy()
 
     # Same parameter mappings as before, but without "params" prefix since it's already in flax_params
     name_mapping = {
@@ -122,8 +124,8 @@ def convert_pytorch_to_jax_cpu(pytorch_state_dict, flax_params):
         np_array = torch_to_numpy(tensor)
         if needs_transpose:
             np_array = np_array.T
-        # Only convert to JAX array at the end
-        return jnp.array(np_array)
+        # Keep as NumPy: avoids an extra full copy of the weights in JAX memory
+        return np_array
 
     # Convert non-layer parameters
     for torch_name, jax_path in name_mapping.items():
@@ -145,7 +147,7 @@ def convert_pytorch_to_jax_cpu(pytorch_state_dict, flax_params):
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     # Convert layer parameters
-    num_layers = 28
+    num_layers = sum(k.startswith("layers_") for k in jax_params["model"])
     for layer_idx in range(num_layers):
         for torch_template, jax_path in layer_mapping.items():
             torch_name = torch_template.format(layer_idx)
@@ -169,6 +171,14 @@ def convert_pytorch_to_jax_cpu(pytorch_state_dict, flax_params):
                 del tensor
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
+    missing = [
+        jax.tree_util.keystr(path)
+        for path, leaf in jax.tree_util.tree_leaves_with_path(jax_params)
+        if isinstance(leaf, jax.ShapeDtypeStruct)
+    ]
+    if missing:
+        raise ValueError(f"No PyTorch weights found for: {missing}")
+
     return freeze(jax_params)
 
 
@@ -178,7 +188,10 @@ def convert_model_cpu(flax_model, torch_model):
     key = jax.random.PRNGKey(0)
     init_inputs = jnp.ones((1, 1), dtype=jnp.int32)
 
-    variables = flax_model.init(key, input_ids=init_inputs)
+    # Only the parameter structure is needed, so avoid allocating random weights.
+    variables = jax.eval_shape(
+        lambda: flax_model.init(key, input_ids=init_inputs)
+    )
 
     # Load PyTorch weights
     pytorch_state_dict = torch_model.state_dict()
@@ -191,29 +204,26 @@ def convert_model_cpu(flax_model, torch_model):
     return converted_params
 
 
-def torch_to_flax():
+def torch_to_flax(model_name=MODEL_NAME, output_path="flax_params.msgpack"):
 
-    # Load the PyTorch model
-    model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
-    torch_model = AutoModelForCausalLM.from_pretrained(model_name, device_map="cpu")
+    # Load the PyTorch model in its native bfloat16 to halve peak memory.
+    torch_model = AutoModelForCausalLM.from_pretrained(
+        model_name, torch_dtype=torch.bfloat16
+    )
 
-    # Load the Flax model
+    # Load the Flax model with the same config as the PyTorch model
     with jax.default_device(jax.devices("cpu")[0]):
-        flax_model = Qwen2ForCausalLM(Qwen2Config())
+        flax_model = Qwen2ForCausalLM(Qwen2Config(**torch_model.config.to_dict()))
 
         # Convert the PyTorch parameters
         converted_params = convert_model_cpu(flax_model, torch_model)
 
-        # Saving parameters:
-        with open("flax_params.msgpack", "wb") as f:
-            bytes_output = flax.serialization.to_bytes(converted_params)
-            f.write(bytes_output)
-
+    # Free the PyTorch weights before serializing to keep peak memory low
     del torch_model
-    del flax_model
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
-    del converted_params
-    del bytes_output
+
+    # Saving parameters:
+    with open(output_path, "wb") as f:
+        f.write(flax.serialization.to_bytes(converted_params))
 
 
 if __name__ == "__main__":
